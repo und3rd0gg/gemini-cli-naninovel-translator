@@ -208,26 +208,53 @@ class Translator:
         self.prompt_manager = prompt_manager
 
     def _print_progress(self, iteration, total, prefix='', suffix='', decimals=1, length=40):
-        """
-        Call in a loop to create terminal progress bar
-        """
+        if total == 0: total = 1
         percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
         filled_length = int(length * iteration // total)
         bar = Colors.GREEN + '█' * filled_length + Colors.ENDC + '-' * (length - filled_length)
-        # Print carriage return to overwrite line, but do NOT print newline
         sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}')
         sys.stdout.flush()
 
     def _log(self, message, progress_state=None):
-        """
-        Prints a log message by clearing the current progress bar line, 
-        printing the message, and then repainting the progress bar (if state provided).
-        """
-        # Clear current line
         sys.stdout.write('\r' + ' ' * 100 + '\r')
         print(message)
         if progress_state:
             self._print_progress(*progress_state)
+
+    def _scan_workload(self, files, specific_lang=None):
+        """Scans headers to calculate total translation tasks (Language Columns)."""
+        total_steps = 0
+        file_meta = [] # (file_path, target_indices_dict)
+
+        for file_path in files:
+            try:
+                with open(file_path, 'r', encoding='utf-8', newline='') as f:
+                    header_line = f.readline()
+                    if not header_line: continue
+                    # Simple split is risky for CSV, but headers usually safe. 
+                    # Better use csv reader for just one line.
+                    pass
+                
+                # Re-open properly to parse header
+                with open(file_path, 'r', encoding='utf-8', newline='') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if not header or 'ru' not in header: continue
+                    
+                    ru_index = header.index('ru')
+                    targets = {}
+                    for i in range(ru_index + 1, len(header)):
+                        code = header[i].strip()
+                        if code:
+                            if specific_lang and code != specific_lang: continue
+                            targets[code] = i
+                    
+                    if targets:
+                        total_steps += len(targets)
+                        file_meta.append((file_path, targets))
+            except Exception:
+                continue
+        return total_steps, file_meta
 
     def process(self, input_path, target_lang=None, prompt_name="default"):
         start_time = time.time()
@@ -269,115 +296,94 @@ class Translator:
         print(f"=========================================={Colors.ENDC}")
         print(f" {Colors.BOLD}Source:{Colors.ENDC}   {input_path}")
         print(f" {Colors.BOLD}Output:{Colors.ENDC}   {root_output_dir}")
-        print(f" {Colors.BOLD}Prompt:{Colors.ENDC}   {prompt_name}")
         print(f" {Colors.BOLD}Target:{Colors.ENDC}   {target_lang if target_lang else 'ALL Detected'}")
+        
+        # --- Pre-calculation ---
+        print(f"{Colors.CYAN}Scanning files to calculate workload...{Colors.ENDC}")
+        total_steps, workload_meta = self._scan_workload(files_to_process, target_lang)
+        
         print(f" {Colors.BOLD}Files:{Colors.ENDC}    {len(files_to_process)}")
+        print(f" {Colors.BOLD}Tasks:{Colors.ENDC}    {total_steps} languages total")
         print(f"{Colors.HEADER}=========================================={Colors.ENDC}\n")
 
+        if total_steps == 0:
+            print(f"{Colors.WARNING}Nothing to translate (check headers for 'ru' and target columns).{Colors.ENDC}")
+            return
+
         # --- Processing Loop ---
-        total_files = len(files_to_process)
+        current_step = 0
         errors = 0
         
         # Initial Progress Bar
-        self._print_progress(0, total_files, prefix='Progress:', suffix='Starting...', length=40)
+        self._print_progress(0, total_steps, prefix='Progress:', suffix='Starting...', length=40)
 
-        for i, file_path in enumerate(files_to_process):
+        for file_path, target_indices in workload_meta:
             rel_path = os.path.relpath(file_path, root_input_dir)
-            
-            # Log current file
-            self._log(f"[{i+1}/{total_files}] Processing: {Colors.BOLD}{rel_path}{Colors.ENDC}", 
-                      (i, total_files, 'Progress:', f'Processing {os.path.basename(rel_path)}...', 1, 40))
-            
             output_file_path = os.path.join(root_output_dir, rel_path)
             
-            # Run translation
-            success = self._translate_file(file_path, output_file_path, target_lang, prompt_template, 
-                                         progress_context=(i, total_files))
-            if not success:
+            # Read File Content Once
+            try:
+                with open(file_path, 'r', encoding='utf-8', newline='') as f:
+                    rows = list(csv.reader(f))
+            except Exception as e:
+                self._log(f"{Colors.FAIL}Error reading {rel_path}: {e}{Colors.ENDC}", (current_step, total_steps, 'Progress:', 'Error', 1, 40))
                 errors += 1
+                current_step += len(target_indices) # Skip these steps
+                continue
 
-            # Update Progress Bar for next step
-            self._print_progress(i + 1, total_files, prefix='Progress:', suffix='Completed' if i+1==total_files else 'Working...', length=40)
+            # Identify source text
+            header = rows[0]
+            ru_index = header.index('ru') # We know it exists from scan
+            source_texts = [r[ru_index] if len(r) > ru_index else "" for r in rows[1:]]
+
+            # Process per language
+            for lang_code, col_index in target_indices.items():
+                self._log(f"[{current_step+1}/{total_steps}] {rel_path} -> {Colors.CYAN}{lang_code}{Colors.ENDC}", 
+                          (current_step, total_steps, 'Progress:', f'{lang_code}...', 1, 40))
+                
+                # Format Prompt
+                text_block = "\n".join(source_texts)
+                formatted_prompt = prompt_template.replace("{target_lang}", lang_code).replace("{text}", text_block)
+                
+                # Send Request
+                response, error = GeminiClient.send(formatted_prompt)
+
+                if response:
+                    translated_lines = response.split('\n')
+                    # Fill Data
+                    for i in range(1, len(rows)):
+                        row_idx = i - 1
+                        if row_idx < len(translated_lines):
+                            while len(rows[i]) <= col_index: rows[i].append("")
+                            rows[i][col_index] = translated_lines[row_idx].strip()
+                    
+                    # INCREMENTAL SAVE
+                    try:
+                        os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+                        with open(output_file_path, 'w', encoding='utf-8', newline='') as f:
+                            csv.writer(f).writerows(rows)
+                    except Exception as e:
+                        self._log(f"  {Colors.FAIL}Save Error: {e}{Colors.ENDC}", None)
+                        errors += 1
+
+                else:
+                    self._log(f"  {Colors.FAIL}Translation Failed for {lang_code}: {error}{Colors.ENDC}", None)
+                    errors += 1
+                
+                current_step += 1
+                self._print_progress(current_step, total_steps, prefix='Progress:', suffix='Working...', length=40)
 
         # --- Final Report ---
         elapsed = time.time() - start_time
-        sys.stdout.write('\n') # Move past progress bar
+        sys.stdout.write('\n')
         print(f"\n{Colors.HEADER}------------------------------------------{Colors.ENDC}")
         if errors == 0:
             print(f"{Colors.GREEN}✔ COMPLETED SUCCESSFULLY{Colors.ENDC}")
         else:
             print(f"{Colors.WARNING}⚠ COMPLETED WITH {errors} ERRORS{Colors.ENDC}")
         print(f"Time elapsed: {elapsed:.2f}s")
-        print(f"Files processed: {total_files}")
+        print(f"Total operations: {total_steps}")
         print(f"{Colors.HEADER}------------------------------------------{Colors.ENDC}")
-
-    def _translate_file(self, input_path, output_path, specific_lang, prompt_template, progress_context):
-        try:
-            with open(input_path, 'r', encoding='utf-8', newline='') as f:
-                rows = list(csv.reader(f))
-        except Exception as e:
-            self._log(f"  {Colors.FAIL}Read error: {e}{Colors.ENDC}", (*progress_context, 'Progress:', 'Error reading file', 1, 40))
-            return False
-
-        if not rows: return True
-
-        header = rows[0]
-        try:
-            ru_index = header.index('ru')
-        except ValueError:
-            self._log(f"  {Colors.WARNING}Skipped: No 'ru' column.{Colors.ENDC}", (*progress_context, 'Progress:', 'Skipping...', 1, 40))
-            return False
-
-        target_indices = {}
-        for i in range(ru_index + 1, len(header)):
-            code = header[i].strip()
-            if code: target_indices[code] = i
-
-        if specific_lang:
-            if specific_lang in target_indices:
-                target_indices = {specific_lang: target_indices[specific_lang]}
-            else:
-                target_indices = {}
-
-        if not target_indices:
-            self._log(f"  {Colors.CYAN}No targets to translate.{Colors.ENDC}", (*progress_context, 'Progress:', 'No targets', 1, 40))
-            return True
-
-        source_texts = [r[ru_index] if len(r) > ru_index else "" for r in rows[1:]]
-        has_errors = False
-
-        for lang_code, col_index in target_indices.items():
-            # Update log regarding specific language
-            self._log(f"  > Translating to {Colors.CYAN}{lang_code}{Colors.ENDC}...", 
-                      (*progress_context, 'Progress:', f'Translating {lang_code}...', 1, 40))
-            
-            text_block = "\n".join(source_texts)
-            formatted_prompt = prompt_template.replace("{target_lang}", lang_code).replace("{text}", text_block)
-            
-            response, error = GeminiClient.send(formatted_prompt)
-
-            if response:
-                # Log success (move cursor up one line to overwrite "Translating..." or just append Done)
-                # Simpler: just reprint success message
-                self._log(f"  > Translating to {Colors.CYAN}{lang_code}{Colors.ENDC}: {Colors.GREEN}OK{Colors.ENDC}", 
-                          (*progress_context, 'Progress:', f'Translating {lang_code}...', 1, 40))
-                
-                translated_lines = response.split('\n')
-                for i in range(1, len(rows)):
-                    row_idx = i - 1
-                    if row_idx < len(translated_lines):
-                        while len(rows[i]) <= col_index: rows[i].append("")
-                        rows[i][col_index] = translated_lines[row_idx].strip()
-            else:
-                self._log(f"  > Translating to {Colors.CYAN}{lang_code}{Colors.ENDC}: {Colors.FAIL}FAILED{Colors.ENDC} ({error})", 
-                          (*progress_context, 'Progress:', f'Error {lang_code}', 1, 40))
-                has_errors = True
-
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8', newline='') as f:
-            csv.writer(f).writerows(rows)
-        
-        return not has_errors
 
 # --- Interactive Application ---
 class AppCLI:

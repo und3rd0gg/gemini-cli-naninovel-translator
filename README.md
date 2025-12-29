@@ -1,77 +1,90 @@
-# Инструмент автоматического перевода сценариев (Gemini CLI)
+# Gemini CLI Translator Tool
 
-Этот инструмент представляет собой Python-скрипт для автоматического перевода файлов сценариев/диалогов (в формате CSV) с русского языка на другие языки с использованием модели Gemini.
+A powerful Python utility designed to automate the translation of scenario/dialogue files (CSV) for games and stories using the Gemini CLI. It preserves context, tone, and character voice, making it ideal for narrative-heavy projects like visual novels.
 
-Он идеально подходит для локализации игр (например, визуальных новелл) или историй, где важно сохранение контекста и тона повествования.
+## Key Features
 
-## Основные возможности
+- **Interactive CLI:** User-friendly terminal interface with arrow key navigation, file picker, and menus.
+- **Context-Aware Translation:** Sends entire dialogue blocks to Gemini to maintain narrative consistency.
+- **Prompt Management:**Create, edit, and select custom translation prompts (stored in `prompts/`).
+- **Batch Processing:** Translate single files or entire directories recursively.
+- **Real-time Progress:** Visual progress bar tracking translation status per language.
+- **Incremental Saving:** Saves progress after every translated language to prevent data loss.
+- **Cross-Platform:** Python-based, with specific support for Windows (`gemini.cmd`).
 
-*   **Контекстный перевод:** Отправляет диалоги блоками, чтобы Gemini могла учитывать контекст всей сцены при переводе.
-*   **Пакетная обработка:** Может обрабатывать как отдельные файлы, так и целые папки (рекурсивно), сохраняя структуру директорий.
-*   **Выбор языка:** Перевод на все языки, указанные в заголовке CSV, или только на конкретный выбранный язык.
-*   **Совместимость с Windows:** Скрипт специально настроен для работы через `gemini.cmd`, что решает проблемы с политиками выполнения PowerShell.
+## Prerequisites
 
-## Требования
+1.  **Python 3.x** installed.
+2.  **Gemini CLI** installed and configured (API key set).
+    - Ensure `gemini` (or `gemini.cmd` on Windows) is available in your system PATH.
 
-1.  **Python 3.x**: Должен быть установлен в системе.
-2.  **Gemini CLI**: Инструмент командной строки `gemini` должен быть установлен, настроен (API ключ) и доступен в системном PATH.
+## Installation
 
-## Формат входных данных (CSV)
-
-Скрипт ожидает CSV-файлы со следующей структурой:
-*   Первая строка — заголовок.
-*   Обязательно должен присутствовать столбец с названием `ru` (исходный текст).
-*   Остальные столбцы в заголовке (справа от `ru`) воспринимаются как коды целевых языков (например, `en`, `jp`, `fr`).
-
-**Пример CSV:**
-```csv
-ID,Notes,ru,en,jp
-line1,,Привет!,Hello!,
-line2,,Как дела?,How are you?,
+Clone this repository:
+```bash
+git clone https://github.com/und3rd0gg/gemini-cli-naninovel-translator.git
+cd gemini-cli-naninovel-translator
 ```
 
-## Инструкция по использованию
+## Usage
 
-Запускайте скрипт через командную строку (терминал).
-
-### 1. Базовый запуск
-По умолчанию скрипт ищет папку `scenarios` в текущей директории и переводит все найденные в ней CSV файлы на все языки, указанные в заголовках файлов.
-
+### Interactive Mode (Recommended)
+Simply run the script without arguments to launch the interactive menu:
 ```bash
 python translate_scenarios.py
 ```
+- **Navigate:** Use `Up/Down` arrows.
+- **Select:** Press `Enter`.
+- **Back:** Press `Esc` or `Left` arrow.
+- **File Picker:** Browse folders and select specific `.csv` files or choose `< SELECT CURRENT FOLDER >` to translate everything in a directory.
 
-### 2. Указание входного пути
-Вы можете указать конкретную папку или файл для перевода.
+### Command Line Mode (Headless)
+For automation or CI/CD pipelines, you can pass arguments directly:
 
-**Перевод конкретной папки:**
 ```bash
-python translate_scenarios.py path/to/my_folder
+# Translate all files in 'scenarios' folder using default prompt
+python translate_scenarios.py scenarios
+
+# Translate a specific file to English only
+python translate_scenarios.py scenarios/chapter1.csv --lang en
+
+# Use a custom prompt template named 'funny_style.txt' from prompts folder
+python translate_scenarios.py scenarios --prompt funny_style
 ```
 
-**Перевод конкретного файла:**
-```bash
-python translate_scenarios.py path/to/my_folder/dialogue.csv
+### Arguments
+- `input_path`: Path to a `.csv` file or a directory containing them. (Default: `scenarios`)
+- `--lang`: Target language code (e.g., `en`, `ja`). If omitted, translates to all languages found in the CSV header.
+- `--prompt`: Name of the prompt file in `prompts/` (without `.txt` extension). (Default: `default`)
+
+## Prompt Management
+The tool looks for prompt templates in the `prompts/` directory.
+- **Default:** `prompts/default.txt` is created automatically.
+- **Custom Prompts:** Create new `.txt` files in this folder.
+- **Placeholders:** Your prompt **MUST** include:
+  - `{target_lang}`: Where the target language name/code will be inserted.
+  - `{text}`: Where the source text to translate will be inserted.
+
+Example `custom_prompt.txt`:
+```text
+Translate this RPG dialogue to {target_lang}. 
+Keep it medieval and archaic.
+Input:
+{text}
 ```
 
-### 3. Выбор конкретного языка
-Используйте флаг `--lang`, чтобы перевести только на один определенный язык (код языка должен совпадать с заголовком в CSV). Это полезно, если вы добавили новый язык или хотите обновить только его.
+## CSV Format
+The tool expects standard CSV files with a header row.
+- **Source Column:** Must be named `ru` (Russian) currently.
+- **Target Columns:** Any other columns (e.g., `en`, `jp`, `fr`) are treated as targets.
+- **Structure:**
+  ```csv
+  id, notes, ru, en, jp
+  line1,,Привет,Hello,
+  line2,,Пока,Bye,
+  ```
 
-**Пример (перевод только на английский):**
-```bash
-python translate_scenarios.py --lang en
-```
-
-**Комбинированный пример (перевод файла chapter1.csv только на японский):**
-```bash
-python translate_scenarios.py scenarios/chapter1.csv --lang jp
-```
-
-## Результат работы
-
-Скрипт создает копию входных данных с суффиксом `_translated`. Исходные файлы не перезаписываются.
-
-*   Если на вход подана папка `scenarios`, результат будет в `scenarios_translated`.
-*   Если на вход подан файл `data/story.csv`, результат будет в папке `data_translated/story.csv`.
-
-Внутри выходной папки полностью сохраняется структура вложенных папок исходной директории.
+## Output
+Translated files are saved in a new directory with the `_translated` suffix, preserving the original folder structure.
+- Input: `scenarios/intro.csv`
+- Output: `scenarios_translated/intro.csv`

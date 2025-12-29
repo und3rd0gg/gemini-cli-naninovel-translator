@@ -3,193 +3,486 @@ import subprocess
 import sys
 import os
 import argparse
-import shutil
+import glob
+import time
+import msvcrt
 
-def get_gemini_translation(prompt):
-    """
-    Sends the prompt to the Gemini CLI and returns the response.
-    """
-    try:
-        # We use gemini.cmd to bypass PowerShell policy issues on Windows.
-        command = ['cmd', '/c', 'gemini.cmd']
+# --- Colors & Styles ---
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    
+    # Backgrounds
+    BG_BLUE = '\033[44m'
+    BG_SELECTED = '\033[7m' # Inverse
+
+# --- Console Helper (Windows) ---
+class ConsoleInput:
+    KEY_UP = 72
+    KEY_DOWN = 80
+    KEY_LEFT = 75
+    KEY_RIGHT = 77
+    KEY_ENTER = 13
+    KEY_ESC = 27
+
+    @staticmethod
+    def get_key():
+        """Reads a keypress and returns the key code."""
+        key = msvcrt.getch()
+        if key == b'\xe0':  # Arrow keys prefix
+            key = msvcrt.getch()
+            return ord(key)
+        return ord(key)
+
+# --- UI Components ---
+class TUI:
+    def clear(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def print_header(self, title, subtitle=None):
+        self.clear()
+        print(f"{Colors.HEADER}=========================================={Colors.ENDC}")
+        print(f"   {Colors.BOLD}{title}{Colors.ENDC}")
+        if subtitle:
+            print(f"   {subtitle}")
+        print(f"{Colors.HEADER}=========================================={Colors.ENDC}\n")
+
+    def show_menu(self, title, options, subtitle=None):
+        """
+        Renders a navigable menu.
+        options: list of strings or tuples (label, value).
+        Returns: selected index or -1 if cancelled (Esc/Left).
+        """
+        current_idx = 0
+        while True:
+            self.print_header(title, subtitle)
+            
+            # Instructions
+            print(f"{Colors.BLUE}[↑/↓] Navigate   [Enter/→] Select   [Esc/←] Back{Colors.ENDC}\n")
+
+            for i, option in enumerate(options):
+                label = option if isinstance(option, str) else option[0]
+                
+                if i == current_idx:
+                    # Highlighted style
+                    print(f"  {Colors.CYAN}{Colors.BOLD}> {label} <{Colors.ENDC}")
+                else:
+                    # Normal style
+                    print(f"    {label}")
+
+            key = ConsoleInput.get_key()
+
+            if key == ConsoleInput.KEY_UP:
+                current_idx = (current_idx - 1) % len(options)
+            elif key == ConsoleInput.KEY_DOWN:
+                current_idx = (current_idx + 1) % len(options)
+            elif key == ConsoleInput.KEY_ENTER or key == ConsoleInput.KEY_RIGHT:
+                return current_idx
+            elif key == ConsoleInput.KEY_ESC or key == ConsoleInput.KEY_LEFT:
+                return -1
+
+    def file_picker(self, start_path=".", allowed_extensions=None):
+        """
+        Navigable file explorer.
+        Returns: absolute path of selected file/folder or None.
+        """
+        current_path = os.path.abspath(start_path)
+        if not os.path.exists(current_path):
+            current_path = os.getcwd()
         
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8'
-        )
+        while True:
+            items = []
+            # Options to navigate/select
+            items.append((f"{Colors.GREEN}< SELECT CURRENT FOLDER >{Colors.ENDC}", "."))
+            items.append((".. (Go Up)", ".."))
+            
+            try:
+                # List directories first
+                with os.scandir(current_path) as it:
+                    entries = sorted(list(it), key=lambda e: (not e.is_dir(), e.name.lower()))
+                    
+                    for entry in entries:
+                        if entry.is_dir():
+                            items.append((f"[{entry.name}]", entry.name))
+                        elif entry.is_file():
+                            if allowed_extensions:
+                                if any(entry.name.lower().endswith(ext) for ext in allowed_extensions):
+                                    items.append((entry.name, entry.name))
+                            else:
+                                items.append((entry.name, entry.name))
+            except PermissionError:
+                print(f"{Colors.FAIL}Permission denied!{Colors.ENDC}")
+                time.sleep(1)
+                return None
+
+            idx = self.show_menu("File Explorer", items, subtitle=f"Current: {current_path}")
+
+            if idx == -1:
+                return None # Cancelled
+            
+            selected_label, selected_name = items[idx]
+            
+            if selected_name == ".":
+                return current_path
+            elif selected_name == "..":
+                current_path = os.path.dirname(current_path)
+            else:
+                full_path = os.path.join(current_path, selected_name)
+                if os.path.isdir(full_path):
+                    current_path = full_path # Dive in
+                else:
+                    return full_path # Selected file
+
+    def input_text(self, prompt, default=""):
+        """Standard text input wrapper."""
+        print(f"\n{Colors.GREEN}?{Colors.ENDC} {prompt} [{default}]: ", end="")
+        val = input().strip()
+        return val if val else default
+
+# --- Prompt Manager ---
+class PromptManager:
+    def __init__(self, prompts_dir="prompts"):
+        self.prompts_dir = prompts_dir
+        if not os.path.exists(self.prompts_dir):
+            os.makedirs(self.prompts_dir)
         
-        stdout, stderr = process.communicate(input=prompt)
-        
-        if process.returncode != 0:
-            # If stderr is empty, sometimes error info is in stdout depending on the tool
-            err_msg = stderr if stderr else stdout
-            print(f"Error calling Gemini CLI: {err_msg}", file=sys.stderr)
+        # Ensure default prompt always exists
+        default_path = os.path.join(self.prompts_dir, "default.txt")
+        if not os.path.exists(default_path):
+            self.save_prompt("default", 
+                "You are a professional translator. Translate the following scenario text from Russian (ru) to {target_lang}.\n"
+                "The text is a dialogue/script for a game or story. Maintain the context, tone, and character styles.\n"
+                "Output ONLY the translated lines, one per line, corresponding exactly to the input lines.\n"
+                "Input:\n{text}"
+            )
+
+    def list_prompts(self):
+        files = glob.glob(os.path.join(self.prompts_dir, "*.txt"))
+        return [os.path.splitext(os.path.basename(f))[0] for f in files]
+
+    def load_prompt(self, name):
+        path = os.path.join(self.prompts_dir, f"{name}.txt")
+        if not os.path.exists(path):
             return None
-            
-        return stdout.strip()
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def save_prompt(self, name, content):
+        path = os.path.join(self.prompts_dir, f"{name}.txt")
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+
+# --- Gemini Client ---
+class GeminiClient:
+    @staticmethod
+    def send(prompt):
+        try:
+            command = ['cmd', '/c', 'gemini.cmd']
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8'
+            )
+            stdout, stderr = process.communicate(input=prompt)
+            if process.returncode != 0:
+                err_msg = stderr if stderr else stdout
+                return None, err_msg.strip()
+            return stdout.strip(), None
+        except Exception as e:
+            return None, str(e)
+
+# --- Translator Logic ---
+class Translator:
+    def __init__(self, prompt_manager):
+        self.prompt_manager = prompt_manager
+
+    def _print_progress(self, iteration, total, prefix='', suffix='', decimals=1, length=40):
+        """
+        Call in a loop to create terminal progress bar
+        """
+        percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+        filled_length = int(length * iteration // total)
+        bar = Colors.GREEN + '█' * filled_length + Colors.ENDC + '-' * (length - filled_length)
+        # Print carriage return to overwrite line, but do NOT print newline
+        sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}')
+        sys.stdout.flush()
+
+    def _log(self, message, progress_state=None):
+        """
+        Prints a log message by clearing the current progress bar line, 
+        printing the message, and then repainting the progress bar (if state provided).
+        """
+        # Clear current line
+        sys.stdout.write('\r' + ' ' * 100 + '\r')
+        print(message)
+        if progress_state:
+            self._print_progress(*progress_state)
+
+    def process(self, input_path, target_lang=None, prompt_name="default"):
+        start_time = time.time()
+        input_path = os.path.abspath(input_path)
         
-    except Exception as e:
-        print(f"Exception running Gemini CLI: {e}", file=sys.stderr)
-        return None
+        if not os.path.exists(input_path):
+            print(f"{Colors.FAIL}Path not found: {input_path}{Colors.ENDC}")
+            return
 
-def translate_csv_file(input_path, output_path, specific_lang=None):
-    """
-    Reads a CSV, translates content, and writes to output path.
-    """
-    print(f"  Processing: {os.path.basename(input_path)}")
-    
-    try:
-        with open(input_path, 'r', encoding='utf-8', newline='') as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-    except Exception as e:
-        print(f"  Error reading file {input_path}: {e}")
-        return
+        # --- Discovery ---
+        files_to_process = []
+        root_input_dir = ""
+        root_output_dir = ""
 
-    if not rows:
-        print(f"  Skipping empty file: {os.path.basename(input_path)}")
-        return
-
-    header = rows[0]
-    
-    # Find Source Column
-    try:
-        ru_index = header.index('ru')
-    except ValueError:
-        print(f"  Skipping {os.path.basename(input_path)}: Source column 'ru' not found in header.")
-        return
-
-    # Identify Target Columns
-    target_indices = {}
-    for i in range(ru_index + 1, len(header)):
-        lang_code = header[i].strip()
-        if lang_code:
-            target_indices[lang_code] = i
-
-    # Filter for specific language if requested
-    if specific_lang:
-        if specific_lang in target_indices:
-            target_indices = {specific_lang: target_indices[specific_lang]}
-            print(f"  - Configuration: Translating ONLY to '{specific_lang}' for this file.")
+        if os.path.isfile(input_path):
+            root_input_dir = os.path.dirname(input_path)
+            files_to_process = [input_path]
+            root_output_dir = f"{root_input_dir}_translated"
         else:
-            print(f"  - Warning: Requested language '{specific_lang}' not found in {os.path.basename(input_path)}. Skipping translation for this file.")
-            target_indices = {}
+            root_input_dir = input_path
+            root_output_dir = f"{input_path}_translated"
+            for root, dirs, files in os.walk(input_path):
+                for file in files:
+                    if file.lower().endswith('.csv'):
+                        files_to_process.append(os.path.join(root, file))
 
-    if not target_indices:
-        print("  - No target languages to translate for this file.")
-    
-    # Extract source texts
-    source_texts = []
-    for i in range(1, len(rows)):
-        if len(rows[i]) <= ru_index:
-            source_texts.append("")
-        else:
-            source_texts.append(rows[i][ru_index])
+        if not files_to_process:
+            print(f"{Colors.WARNING}No CSV files found.{Colors.ENDC}")
+            return
 
-    # Translate loop
-    total_languages_for_file = len(target_indices)
-    current_lang_count = 0
-    for lang_code, col_index in target_indices.items():
-        current_lang_count += 1
-        print(f"  - Starting translation to {lang_code} ({current_lang_count}/{total_languages_for_file})...")
+        # --- Configuration Summary ---
+        prompt_template = self.prompt_manager.load_prompt(prompt_name)
+        if not prompt_template:
+            print(f"{Colors.FAIL}Prompt '{prompt_name}' not found!{Colors.ENDC}")
+            return
+
+        print(f"\n{Colors.HEADER}==========================================")
+        print(f"       TRANSLATION TASK STARTED")
+        print(f"=========================================={Colors.ENDC}")
+        print(f" {Colors.BOLD}Source:{Colors.ENDC}   {input_path}")
+        print(f" {Colors.BOLD}Output:{Colors.ENDC}   {root_output_dir}")
+        print(f" {Colors.BOLD}Prompt:{Colors.ENDC}   {prompt_name}")
+        print(f" {Colors.BOLD}Target:{Colors.ENDC}   {target_lang if target_lang else 'ALL Detected'}")
+        print(f" {Colors.BOLD}Files:{Colors.ENDC}    {len(files_to_process)}")
+        print(f"{Colors.HEADER}=========================================={Colors.ENDC}\n")
+
+        # --- Processing Loop ---
+        total_files = len(files_to_process)
+        errors = 0
         
-        prompt = (
-            f"You are a professional translator. Translate the following scenario text from Russian (ru) to {lang_code}.\n"
-            "The text is a dialogue/script for a game or story. Maintain the context, tone, and character styles (e.g., formal vs informal, internal monologue).\n"
-            "Output ONLY the translated lines, one per line, corresponding exactly to the input lines.\n"
-            "Do not include any introduction, numbering, or markdown formatting like ```.\n"
-            "If a line is empty, output an empty line.\n\n"
-            "Input:\n"
-        )
-        
-        for text in source_texts:
-            prompt += f"{text}\n"
+        # Initial Progress Bar
+        self._print_progress(0, total_files, prefix='Progress:', suffix='Starting...', length=40)
 
-        translated_block = get_gemini_translation(prompt)
+        for i, file_path in enumerate(files_to_process):
+            rel_path = os.path.relpath(file_path, root_input_dir)
+            
+            # Log current file
+            self._log(f"[{i+1}/{total_files}] Processing: {Colors.BOLD}{rel_path}{Colors.ENDC}", 
+                      (i, total_files, 'Progress:', f'Processing {os.path.basename(rel_path)}...', 1, 40))
+            
+            output_file_path = os.path.join(root_output_dir, rel_path)
+            
+            # Run translation
+            success = self._translate_file(file_path, output_file_path, target_lang, prompt_template, 
+                                         progress_context=(i, total_files))
+            if not success:
+                errors += 1
 
-        if translated_block:
-            print(f"  - Translation for {lang_code} received.")
-            translated_lines = translated_block.strip().split('\n')
-            
-            # Validation and Filling
-            if len(translated_lines) != len(source_texts):
-                print(f"    Warning: Line count mismatch for {lang_code}. Source: {len(source_texts)}, Translated: {len(translated_lines)}. Attempting to fill best as possible.")
-            
-            for i in range(1, len(rows)):
-                row_idx = i - 1
-                if row_idx < len(translated_lines):
-                    while len(rows[i]) <= col_index:
-                        rows[i].append("")
-                    rows[i][col_index] = translated_lines[row_idx].strip()
+            # Update Progress Bar for next step
+            self._print_progress(i + 1, total_files, prefix='Progress:', suffix='Completed' if i+1==total_files else 'Working...', length=40)
+
+        # --- Final Report ---
+        elapsed = time.time() - start_time
+        sys.stdout.write('\n') # Move past progress bar
+        print(f"\n{Colors.HEADER}------------------------------------------{Colors.ENDC}")
+        if errors == 0:
+            print(f"{Colors.GREEN}✔ COMPLETED SUCCESSFULLY{Colors.ENDC}")
         else:
-            print(f"    Failed to translate to {lang_code}.")
+            print(f"{Colors.WARNING}⚠ COMPLETED WITH {errors} ERRORS{Colors.ENDC}")
+        print(f"Time elapsed: {elapsed:.2f}s")
+        print(f"Files processed: {total_files}")
+        print(f"{Colors.HEADER}------------------------------------------{Colors.ENDC}")
 
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    def _translate_file(self, input_path, output_path, specific_lang, prompt_template, progress_context):
+        try:
+            with open(input_path, 'r', encoding='utf-8', newline='') as f:
+                rows = list(csv.reader(f))
+        except Exception as e:
+            self._log(f"  {Colors.FAIL}Read error: {e}{Colors.ENDC}", (*progress_context, 'Progress:', 'Error reading file', 1, 40))
+            return False
 
-    # Write output
-    with open(output_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
-    
-    print(f"  - File translated and saved to {output_path}")
+        if not rows: return True
+
+        header = rows[0]
+        try:
+            ru_index = header.index('ru')
+        except ValueError:
+            self._log(f"  {Colors.WARNING}Skipped: No 'ru' column.{Colors.ENDC}", (*progress_context, 'Progress:', 'Skipping...', 1, 40))
+            return False
+
+        target_indices = {}
+        for i in range(ru_index + 1, len(header)):
+            code = header[i].strip()
+            if code: target_indices[code] = i
+
+        if specific_lang:
+            if specific_lang in target_indices:
+                target_indices = {specific_lang: target_indices[specific_lang]}
+            else:
+                target_indices = {}
+
+        if not target_indices:
+            self._log(f"  {Colors.CYAN}No targets to translate.{Colors.ENDC}", (*progress_context, 'Progress:', 'No targets', 1, 40))
+            return True
+
+        source_texts = [r[ru_index] if len(r) > ru_index else "" for r in rows[1:]]
+        has_errors = False
+
+        for lang_code, col_index in target_indices.items():
+            # Update log regarding specific language
+            self._log(f"  > Translating to {Colors.CYAN}{lang_code}{Colors.ENDC}...", 
+                      (*progress_context, 'Progress:', f'Translating {lang_code}...', 1, 40))
+            
+            text_block = "\n".join(source_texts)
+            formatted_prompt = prompt_template.replace("{target_lang}", lang_code).replace("{text}", text_block)
+            
+            response, error = GeminiClient.send(formatted_prompt)
+
+            if response:
+                # Log success (move cursor up one line to overwrite "Translating..." or just append Done)
+                # Simpler: just reprint success message
+                self._log(f"  > Translating to {Colors.CYAN}{lang_code}{Colors.ENDC}: {Colors.GREEN}OK{Colors.ENDC}", 
+                          (*progress_context, 'Progress:', f'Translating {lang_code}...', 1, 40))
+                
+                translated_lines = response.split('\n')
+                for i in range(1, len(rows)):
+                    row_idx = i - 1
+                    if row_idx < len(translated_lines):
+                        while len(rows[i]) <= col_index: rows[i].append("")
+                        rows[i][col_index] = translated_lines[row_idx].strip()
+            else:
+                self._log(f"  > Translating to {Colors.CYAN}{lang_code}{Colors.ENDC}: {Colors.FAIL}FAILED{Colors.ENDC} ({error})", 
+                          (*progress_context, 'Progress:', f'Error {lang_code}', 1, 40))
+                has_errors = True
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8', newline='') as f:
+            csv.writer(f).writerows(rows)
+        
+        return not has_errors
+
+# --- Interactive Application ---
+class AppCLI:
+    def __init__(self):
+        self.tui = TUI()
+        self.prompt_manager = PromptManager()
+        self.translator = Translator(self.prompt_manager)
+
+    def menu_prompts(self):
+        while True:
+            prompts = self.prompt_manager.list_prompts()
+            menu_items = sorted(prompts) + ["+ Create New"]
+            
+            idx = self.tui.show_menu("Prompt Management", menu_items)
+            
+            if idx == -1: break
+            
+            selected = menu_items[idx]
+            
+            if selected == "+ Create New":
+                self.tui.clear()
+                print(f"{Colors.HEADER}--- Create New Prompt ---{Colors.ENDC}")
+                name = self.tui.input_text("Enter prompt name (no spaces)")
+                print("\nEnter prompt text (Use {target_lang} and {text} placeholders).")
+                print("Type 'END' on a new line to finish:")
+                lines = []
+                while True:
+                    line = input()
+                    if line.strip() == 'END': break
+                    lines.append(line)
+                self.prompt_manager.save_prompt(name, "\n".join(lines))
+            else:
+                # View/Edit could go here, for now just view
+                self.tui.clear()
+                print(f"{Colors.CYAN}--- Content of '{selected}' ---{Colors.ENDC}")
+                print(self.prompt_manager.load_prompt(selected))
+                print(f"\n{Colors.BLUE}Press any key to return...{Colors.ENDC}")
+                msvcrt.getch()
+
+    def run(self):
+        while True:
+            options = [
+                ("Translate Scenarios", "translate"),
+                ("Manage Prompts", "prompts"),
+                ("Exit", "exit")
+            ]
+            
+            idx = self.tui.show_menu("GEMINI TRANSLATOR", options)
+            if idx == -1: idx = 2 # Exit on Esc from main menu
+            
+            choice = options[idx][1]
+            
+            if choice == "exit":
+                self.tui.clear()
+                print("Goodbye!")
+                sys.exit(0)
+                
+            elif choice == "prompts":
+                self.menu_prompts()
+                
+            elif choice == "translate":
+                # 1. Select Path
+                path = self.tui.file_picker(start_path="scenarios", allowed_extensions=['.csv'])
+                if not path: continue # User cancelled
+
+                # 2. Select Prompt
+                prompts = self.prompt_manager.list_prompts()
+                if not prompts:
+                    print("No prompts found!")
+                    time.sleep(2)
+                    continue
+                    
+                p_idx = self.tui.show_menu("Select Prompt Template", prompts)
+                if p_idx == -1: continue
+                selected_prompt = prompts[p_idx]
+
+                # 3. Select Language
+                self.tui.clear()
+                print(f"{Colors.HEADER}--- Translation Configuration ---{Colors.ENDC}")
+                print(f"Target: {path}")
+                print(f"Prompt: {selected_prompt}")
+                lang = self.tui.input_text("Target language code (Leave empty for all)", default="")
+                
+                # Run
+                self.translator.process(path, lang, selected_prompt)
+                
+                print(f"\n{Colors.BLUE}Press any key to continue...{Colors.ENDC}")
+                msvcrt.getch()
 
 def main():
-    parser = argparse.ArgumentParser(description='Translate scenario CSV files using Gemini.')
-    parser.add_argument('input_path', nargs='?', default='scenarios', help='Path to input folder or specific file (default: "scenarios")')
-    parser.add_argument('--lang', type=str, help='Specific target language code to translate (e.g., "en").')
-    args = parser.parse_args()
-
-    input_path = os.path.abspath(args.input_path)
-
-    if not os.path.exists(input_path):
-        print(f"Error: Input path '{input_path}' does not exist.")
-        return
-
-    # Determine Root Dir and Output Dir
-    root_input_dir = ""
-    root_output_dir = ""
-    files_to_process = []
-
-    if os.path.isfile(input_path):
-        # Single file mode
-        root_input_dir = os.path.dirname(input_path)
-        files_to_process = [input_path]
-        root_output_dir = f"{root_input_dir}_translated"
+    if len(sys.argv) > 1:
+        # Legacy Headless Mode
+        parser = argparse.ArgumentParser(description='Translate scenario CSV files.')
+        parser.add_argument('input_path', nargs='?', default='scenarios', help='Path to input')
+        parser.add_argument('--lang', type=str, help='Specific target language')
+        parser.add_argument('--prompt', type=str, default='default', help='Prompt template name')
+        args = parser.parse_args()
+        
+        pm = PromptManager()
+        Translator(pm).process(args.input_path, args.lang, args.prompt)
     else:
-        # Directory mode
-        root_input_dir = input_path
-        root_output_dir = f"{input_path}_translated"
-        for root, dirs, files in os.walk(input_path):
-            for file in files:
-                if file.lower().endswith('.csv'):
-                    files_to_process.append(os.path.join(root, file))
-
-    print(f"Starting translation process.")
-    print(f"Input path: {input_path}")
-    print(f"Output root directory: {root_output_dir}")
-    
-    if not files_to_process:
-        print("No CSV files found to process.")
-        return
-
-    total_files = len(files_to_process)
-    for i, file_path in enumerate(files_to_process):
-        print(f"\n--- Processing file {i+1} of {total_files}: {os.path.relpath(file_path, root_input_dir)} ---")
-        
-        # Calculate relative path to maintain structure
-        rel_path = os.path.relpath(file_path, root_input_dir)
-        
-        # Construct full output path
-        output_file_path = os.path.join(root_output_dir, rel_path)
-        
-        translate_csv_file(file_path, output_file_path, args.lang)
-
-    print("\nAll translation tasks completed.")
+        AppCLI().run()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

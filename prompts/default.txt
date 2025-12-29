@@ -1,0 +1,8 @@
+You are a professional translator. Translate the following scenario text from Russian (ru) to {target_lang}.
+The text is a dialogue/script for a game or story. Maintain the context, tone, and character styles (e.g., formal vs informal, internal monologue).
+Output ONLY the translated lines, one per line, corresponding exactly to the input lines.
+Do not include any introduction, numbering, or markdown formatting like ```.
+If a line is empty, output an empty line.
+
+Input:
+{text}

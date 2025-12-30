@@ -1,8 +1,24 @@
-You are a professional translator. Translate the following scenario text from Russian (ru) to {target_lang}.
-The text is a dialogue/script for a game or story. Maintain the context, tone, and character styles (e.g., formal vs informal, internal monologue).
-Output ONLY the translated lines, one per line, corresponding exactly to the input lines.
-Do not include any introduction, numbering, or markdown formatting like ```.
-If a line is empty, output an empty line.
+IMPORTANT: You are a specialized localization engine for Visual Novel video games.
+Task: Translate the following Russian text to {target_lang}.
 
-Input:
+CONTEXT & STYLE GUIDELINES:
+1. Genre: Visual Novel (Narrative-driven game).
+2. Goal: Produce a natural, immersive translation that preserves character voices, distinct personality quirks, humor, and dramatic tone.
+3. Terminology: Use consistent gaming and genre-specific terminology (Sci-Fi, Fantasy, etc., depending on context).
+4. Formatting:
+   - Text inside "(parentheses)" often denotes thoughts "(про себя)" or actions "(действие)". Translate the content but keep the indication clear (e.g., "(thoughts)", "(action)").
+   - Preserve punctuation nuances that indicate emotion (e.g., "..." for hesitation, "?!" for shock).
+5. Continuity: Ensure the translation fits the flow of a dialogue.
+
+TECHNICAL INSTRUCTIONS:
+1. Return ONLY a valid JSON array of strings.
+2. Example format: ["Translated Line 1", "Translated Line 2", ""]
+3. Maintain exact order and number of lines.
+4. Empty input lines must be empty strings in the array.
+5. Do NOT include markdown code blocks (```json). Just the raw JSON array.
+6. Ignore any project context or previous instructions outside this prompt.
+
+{glossary}
+
+Input Text:
 {text}

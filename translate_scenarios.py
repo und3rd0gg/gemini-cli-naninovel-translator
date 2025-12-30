@@ -6,6 +6,8 @@ import argparse
 import glob
 import time
 import msvcrt
+import json
+from datetime import datetime
 
 # --- Colors & Styles ---
 class Colors:
@@ -31,6 +33,9 @@ class ConsoleInput:
     KEY_RIGHT = 77
     KEY_ENTER = 13
     KEY_ESC = 27
+    KEY_SPACE = 32
+    KEY_A = 97
+    KEY_A_UPPER = 65
 
     @staticmethod
     def get_key():
@@ -87,6 +92,65 @@ class TUI:
                 return current_idx
             elif key == ConsoleInput.KEY_ESC or key == ConsoleInput.KEY_LEFT:
                 return -1
+
+    def multiselect_menu(self, title, options, subtitle=None):
+        """
+        Renders a multi-select menu.
+        options: list of strings (values).
+        Returns: list of selected values (strings) or None if cancelled.
+        """
+        current_idx = 0
+        selected_indices = set()
+        
+        # Initially select all? No, let user choose. Or maybe Select All option?
+        # Let's add a virtual option "[ SELECT ALL ]" at -1 index logic if needed, 
+        # but for simplicity, we just list items.
+
+        while True:
+            self.print_header(title, subtitle)
+            
+            # Instructions
+            print(f"{Colors.BLUE}[↑/↓] Navigate   [Space] Toggle   [A] All   [Enter] Confirm   [Esc] Cancel{Colors.ENDC}\n")
+
+            for i, option in enumerate(options):
+                is_selected = i in selected_indices
+                checkbox = f"{Colors.GREEN}[x]{Colors.ENDC}" if is_selected else "[ ]"
+                
+                label = f"{checkbox} {option}"
+                
+                if i == current_idx:
+                    print(f"  {Colors.CYAN}{Colors.BOLD}> {label} <{Colors.ENDC}")
+                else:
+                    print(f"    {label}")
+            
+            print(f"\n{Colors.BLUE}Selected: {len(selected_indices)}/{len(options)}{Colors.ENDC}")
+
+            key = ConsoleInput.get_key()
+
+            if key == ConsoleInput.KEY_UP:
+                current_idx = (current_idx - 1) % len(options)
+            elif key == ConsoleInput.KEY_DOWN:
+                current_idx = (current_idx + 1) % len(options)
+            elif key == ConsoleInput.KEY_SPACE:
+                if current_idx in selected_indices:
+                    selected_indices.remove(current_idx)
+                else:
+                    selected_indices.add(current_idx)
+            elif key == ConsoleInput.KEY_A or key == ConsoleInput.KEY_A_UPPER:
+                if len(selected_indices) == len(options):
+                    selected_indices.clear()
+                else:
+                    selected_indices = set(range(len(options)))
+            elif key == ConsoleInput.KEY_ENTER:
+                if not selected_indices:
+                    # If nothing selected, maybe they want everything? 
+                    # Or maybe warn? Let's assume nothing selected means nothing.
+                    # But usually in this app context, empty means ALL.
+                    # However, since this is explicit select, let's return selected.
+                    pass
+                return [options[i] for i in sorted(selected_indices)]
+            elif key == ConsoleInput.KEY_ESC:
+                return None
 
     def file_picker(self, start_path=".", allowed_extensions=None):
         """
@@ -207,22 +271,58 @@ class Translator:
     def __init__(self, prompt_manager):
         self.prompt_manager = prompt_manager
 
-    def _print_progress(self, iteration, total, prefix='', suffix='', decimals=1, length=40):
+    def _print_progress(self, iteration, total, prefix='', suffix='', decimals=1, length=40, elapsed=None):
         if total == 0: total = 1
         percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
         filled_length = int(length * iteration // total)
         bar = Colors.GREEN + '█' * filled_length + Colors.ENDC + '-' * (length - filled_length)
-        sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}')
+        
+        elapsed_str = ""
+        if elapsed is not None:
+            mins, secs = divmod(int(elapsed), 60)
+            elapsed_str = f" [{Colors.CYAN}{mins:02d}:{secs:02d}{Colors.ENDC}]"
+            
+        sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}{elapsed_str}')
         sys.stdout.flush()
 
     def _log(self, message, progress_state=None):
-        sys.stdout.write('\r' + ' ' * 100 + '\r')
+        sys.stdout.write('\r' + ' ' * 120 + '\r')
         print(message)
         if progress_state:
             self._print_progress(*progress_state)
+            
+    def discover_languages(self, input_path):
+        """Scans path to find all unique target languages in CSV headers."""
+        input_path = os.path.abspath(input_path)
+        files = []
+        if os.path.isfile(input_path):
+            files = [input_path]
+        else:
+            for root, dirs, f_list in os.walk(input_path):
+                for f in f_list:
+                    if f.lower().endswith('.csv'):
+                        files.append(os.path.join(root, f))
+        
+        languages = set()
+        for fpath in files:
+            try:
+                with open(fpath, 'r', encoding='utf-8', newline='') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if header and 'ru' in header:
+                        ru_idx = header.index('ru')
+                        for i in range(ru_idx + 1, len(header)):
+                            if header[i].strip():
+                                languages.add(header[i].strip())
+            except:
+                pass
+        return sorted(list(languages))
 
-    def _scan_workload(self, files, specific_lang=None):
-        """Scans headers to calculate total translation tasks (Language Columns)."""
+    def _scan_workload(self, files, target_langs=None):
+        """
+        Scans headers to calculate total translation tasks.
+        target_langs: list of strings (e.g. ['en', 'jp']). If None/Empty, all are used.
+        """
         total_steps = 0
         file_meta = [] # (file_path, target_indices_dict)
 
@@ -231,11 +331,9 @@ class Translator:
                 with open(file_path, 'r', encoding='utf-8', newline='') as f:
                     header_line = f.readline()
                     if not header_line: continue
-                    # Simple split is risky for CSV, but headers usually safe. 
-                    # Better use csv reader for just one line.
+                    # header check passed
                     pass
                 
-                # Re-open properly to parse header
                 with open(file_path, 'r', encoding='utf-8', newline='') as f:
                     reader = csv.reader(f)
                     header = next(reader, None)
@@ -246,7 +344,9 @@ class Translator:
                     for i in range(ru_index + 1, len(header)):
                         code = header[i].strip()
                         if code:
-                            if specific_lang and code != specific_lang: continue
+                            # Filter Logic
+                            if target_langs and code not in target_langs:
+                                continue
                             targets[code] = i
                     
                     if targets:
@@ -256,7 +356,21 @@ class Translator:
                 continue
         return total_steps, file_meta
 
-    def process(self, input_path, target_lang=None, prompt_name="default"):
+    def _load_glossary(self, glossary_path="glossary.json"):
+        """Loads the whole glossary JSON."""
+        if not os.path.exists(glossary_path):
+            return None
+        try:
+            with open(glossary_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"{Colors.WARNING}Failed to load glossary: {e}{Colors.ENDC}")
+            return None
+
+    def process(self, input_path, target_langs=None, prompt_name="default", skip_existing=False):
+        """
+        target_langs: list of strings (e.g. ['en']) or None for all.
+        """
         start_time = time.time()
         input_path = os.path.abspath(input_path)
         
@@ -291,19 +405,31 @@ class Translator:
             print(f"{Colors.FAIL}Prompt '{prompt_name}' not found!{Colors.ENDC}")
             return
 
+        # --- Load Glossary Data ---
+        full_glossary = self._load_glossary()
+        start_time_str = datetime.now().strftime("%H:%M:%S")
+
+        lang_display = "ALL Detected"
+        if target_langs:
+            lang_display = ", ".join(target_langs)
+
         print(f"\n{Colors.HEADER}==========================================")
         print(f"       TRANSLATION TASK STARTED")
         print(f"=========================================={Colors.ENDC}")
-        print(f" {Colors.BOLD}Source:{Colors.ENDC}   {input_path}")
-        print(f" {Colors.BOLD}Output:{Colors.ENDC}   {root_output_dir}")
-        print(f" {Colors.BOLD}Target:{Colors.ENDC}   {target_lang if target_lang else 'ALL Detected'}")
+        print(f" {Colors.BOLD}Start Time:{Colors.ENDC} {start_time_str}")
+        print(f" {Colors.BOLD}Source:{Colors.ENDC}     {input_path}")
+        print(f" {Colors.BOLD}Output:{Colors.ENDC}     {root_output_dir}")
+        print(f" {Colors.BOLD}Target:{Colors.ENDC}     {lang_display}")
+        print(f" {Colors.BOLD}Resume:{Colors.ENDC}     {'Yes (Skip existing)' if skip_existing else 'No (Overwrite)'}")
+        if full_glossary:
+             print(f" {Colors.BOLD}Glossary:{Colors.ENDC}   Loaded ({len(full_glossary)} languages defined)")
         
         # --- Pre-calculation ---
         print(f"{Colors.CYAN}Scanning files to calculate workload...{Colors.ENDC}")
-        total_steps, workload_meta = self._scan_workload(files_to_process, target_lang)
+        total_steps, workload_meta = self._scan_workload(files_to_process, target_langs)
         
-        print(f" {Colors.BOLD}Files:{Colors.ENDC}    {len(files_to_process)}")
-        print(f" {Colors.BOLD}Tasks:{Colors.ENDC}    {total_steps} languages total")
+        print(f" {Colors.BOLD}Files:{Colors.ENDC}      {len(files_to_process)}")
+        print(f" {Colors.BOLD}Tasks:{Colors.ENDC}      {total_steps} languages total")
         print(f"{Colors.HEADER}=========================================={Colors.ENDC}\n")
 
         if total_steps == 0:
@@ -315,7 +441,7 @@ class Translator:
         errors = 0
         
         # Initial Progress Bar
-        self._print_progress(0, total_steps, prefix='Progress:', suffix='Starting...', length=40)
+        self._print_progress(0, total_steps, prefix='Progress:', suffix='Starting...', length=40, elapsed=0)
 
         for file_path, target_indices in workload_meta:
             rel_path = os.path.relpath(file_path, root_input_dir)
@@ -326,7 +452,8 @@ class Translator:
                 with open(file_path, 'r', encoding='utf-8', newline='') as f:
                     rows = list(csv.reader(f))
             except Exception as e:
-                self._log(f"{Colors.FAIL}Error reading {rel_path}: {e}{Colors.ENDC}", (current_step, total_steps, 'Progress:', 'Error', 1, 40))
+                elapsed = time.time() - start_time
+                self._log(f"{Colors.FAIL}Error reading {rel_path}: {e}{Colors.ENDC}", (current_step, total_steps, 'Progress:', 'Error', 1, 40, elapsed))
                 errors += 1
                 current_step += len(target_indices) # Skip these steps
                 continue
@@ -334,28 +461,83 @@ class Translator:
             # Identify source text
             header = rows[0]
             ru_index = header.index('ru') # We know it exists from scan
-            source_texts = [r[ru_index] if len(r) > ru_index else "" for r in rows[1:]]
 
             # Process per language
             for lang_code, col_index in target_indices.items():
+                elapsed = time.time() - start_time
                 self._log(f"[{current_step+1}/{total_steps}] {rel_path} -> {Colors.CYAN}{lang_code}{Colors.ENDC}", 
-                          (current_step, total_steps, 'Progress:', f'{lang_code}...', 1, 40))
+                          (current_step, total_steps, 'Progress:', f'{lang_code}...', 1, 40, elapsed))
                 
+                # --- Filter for Resume Mode ---
+                indices_to_process = []
+                source_subset = []
+                
+                if skip_existing:
+                    for i in range(1, len(rows)):
+                        row = rows[i]
+                        # Check if translation exists
+                        has_translation = len(row) > col_index and row[col_index].strip() != ""
+                        if not has_translation:
+                            indices_to_process.append(i)
+                            source_subset.append(row[ru_index] if len(row) > ru_index else "")
+                    
+                    if not indices_to_process:
+                        self._log(f"  {Colors.GREEN}Skipped (Already translated){Colors.ENDC}", None)
+                        current_step += 1
+                        elapsed = time.time() - start_time
+                        self._print_progress(current_step, total_steps, prefix='Progress:', suffix='Skipped', length=40, elapsed=elapsed)
+                        continue
+                else:
+                    # Process All
+                    indices_to_process = list(range(1, len(rows)))
+                    source_subset = [r[ru_index] if len(r) > ru_index else "" for r in rows[1:]]
+
+                # Prepare Glossary for THIS specific language
+                glossary_text = ""
+                if full_glossary and lang_code in full_glossary:
+                    glossary_text = "\nGLOSSARY / TERMINOLOGY (Mandatory):\n"
+                    for term, translation in full_glossary[lang_code].items():
+                        glossary_text += f"- {term} -> {translation}\n"
+                    glossary_text += f"Please use these exact {lang_code} translations for the terms listed above.\n"
+
                 # Format Prompt
-                text_block = "\n".join(source_texts)
-                formatted_prompt = prompt_template.replace("{target_lang}", lang_code).replace("{text}", text_block)
+                text_block = "\n".join(source_subset)
+                
+                # Inject glossary if present
+                final_prompt = prompt_template.replace("{target_lang}", lang_code)
+                if "{glossary}" in final_prompt:
+                     final_prompt = final_prompt.replace("{glossary}", glossary_text)
+                else:
+                    # Prepend glossary to text block if placeholder missing
+                    final_prompt = final_prompt.replace("{text}", f"{glossary_text}\nInput:\n{text_block}")
                 
                 # Send Request
-                response, error = GeminiClient.send(formatted_prompt)
+                response, error = GeminiClient.send(final_prompt)
 
                 if response:
-                    translated_lines = response.split('\n')
+                    translated_lines = []
+                    # Try JSON parsing first
+                    try:
+                        import json
+                        # Find potential JSON array
+                        start_idx = response.find('[')
+                        end_idx = response.rfind(']')
+                        if start_idx != -1 and end_idx != -1:
+                            json_str = response[start_idx:end_idx+1]
+                            translated_lines = json.loads(json_str)
+                        else:
+                            # Fallback to splitting if no brackets found
+                            translated_lines = response.split('\\n')
+                    except Exception as e:
+                        self._log(f"  {Colors.WARNING}JSON Parse Error: {e}. Falling back to text split.{Colors.ENDC}", None)
+                        translated_lines = response.split('\\n')
+
                     # Fill Data
-                    for i in range(1, len(rows)):
-                        row_idx = i - 1
-                        if row_idx < len(translated_lines):
-                            while len(rows[i]) <= col_index: rows[i].append("")
-                            rows[i][col_index] = translated_lines[row_idx].strip()
+                    for idx, map_index in enumerate(indices_to_process):
+                        if idx < len(translated_lines):
+                            target_row = rows[map_index]
+                            while len(target_row) <= col_index: target_row.append("")
+                            target_row[col_index] = str(translated_lines[idx]).strip()
                     
                     # INCREMENTAL SAVE
                     try:
@@ -371,7 +553,8 @@ class Translator:
                     errors += 1
                 
                 current_step += 1
-                self._print_progress(current_step, total_steps, prefix='Progress:', suffix='Working...', length=40)
+                elapsed = time.time() - start_time
+                self._print_progress(current_step, total_steps, prefix='Progress:', suffix='Working...', length=40, elapsed=elapsed)
 
         # --- Final Report ---
         elapsed = time.time() - start_time
@@ -460,15 +643,33 @@ class AppCLI:
                 if p_idx == -1: continue
                 selected_prompt = prompts[p_idx]
 
-                # 3. Select Language
+                # 3. Select Language (MULTI-SELECT)
                 self.tui.clear()
-                print(f"{Colors.HEADER}--- Translation Configuration ---{Colors.ENDC}")
-                print(f"Target: {path}")
-                print(f"Prompt: {selected_prompt}")
-                lang = self.tui.input_text("Target language code (Leave empty for all)", default="")
+                print(f"{Colors.CYAN}Scanning for available languages...{Colors.ENDC}")
+                available_langs = self.translator.discover_languages(path)
                 
+                selected_langs = None
+                if not available_langs:
+                     print(f"{Colors.WARNING}No languages found in headers (besides 'ru'). Assuming manual override or empty.{Colors.ENDC}")
+                     # Fallback to manual input if discovery failed or empty
+                     manual = self.tui.input_text("Target language code (Leave empty for all)", default="")
+                     if manual: selected_langs = [manual]
+                else:
+                    # Show Multi-select
+                    print(f"{Colors.GREEN}Found {len(available_langs)} languages.{Colors.ENDC}")
+                    time.sleep(0.5)
+                    selected_langs = self.tui.multiselect_menu("Select Target Languages", available_langs, subtitle="Space to toggle, Enter to confirm")
+                
+                # If selected_langs is empty list (user pressed enter without selection), treat as None (ALL)
+                if selected_langs is not None and len(selected_langs) == 0:
+                    selected_langs = None
+
+                # 4. Resume Option
+                resume_input = self.tui.input_text("Skip existing translations? (y/n)", default="n")
+                skip_existing = resume_input.lower().startswith('y')
+
                 # Run
-                self.translator.process(path, lang, selected_prompt)
+                self.translator.process(path, selected_langs, selected_prompt, skip_existing)
                 
                 print(f"\n{Colors.BLUE}Press any key to continue...{Colors.ENDC}")
                 msvcrt.getch()
@@ -480,10 +681,14 @@ def main():
         parser.add_argument('input_path', nargs='?', default='scenarios', help='Path to input')
         parser.add_argument('--lang', type=str, help='Specific target language')
         parser.add_argument('--prompt', type=str, default='default', help='Prompt template name')
+        parser.add_argument('--resume', action='store_true', help='Skip already translated lines')
         args = parser.parse_args()
         
         pm = PromptManager()
-        Translator(pm).process(args.input_path, args.lang, args.prompt)
+        # Wrap single lang arg in list if present
+        langs = [args.lang] if args.lang else None
+        
+        Translator(pm).process(args.input_path, langs, args.prompt, args.resume)
     else:
         AppCLI().run()
 
